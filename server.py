@@ -17,12 +17,28 @@ import asyncio
 import os
 
 from mcp.server.mcpserver import MCPServer
+from mcp.types import ToolAnnotations
 
 from odoo_client import get_client
 
 mcp = MCPServer("odoo-mcp")
 
+# Two independent infrastructure-level switches, one per risk tier. These
+# are a server-side failsafe, NOT the primary permission mechanism — the
+# primary mechanism is the read_only_hint / destructive_hint annotation on
+# each tool below, which lets an MCP client (Claude's connector settings,
+# for instance) offer per-tool "always allow / ask every time / never"
+# controls. A client that respects those hints will ask before ever
+# reaching a write or delete tool; these env vars exist so a compromised or
+# careless client still can't silently mutate data on a server that was
+# only ever meant to be read from.
 WRITE_ENABLED = os.environ.get("MCP_ENABLE_WRITE", "false").lower() == "true"
+DELETE_ENABLED = os.environ.get("MCP_ENABLE_DELETE", "false").lower() == "true"
+
+READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True)
+WRITE_CREATE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)
+WRITE_UPDATE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True)
+DESTRUCTIVE_DELETE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True)
 
 # A handful of noisy/technical models nobody wants surfaced in a "what
 # models exist" call. This is a display filter only — describe_model and
@@ -30,7 +46,7 @@ WRITE_ENABLED = os.environ.get("MCP_ENABLE_WRITE", "false").lower() == "true"
 _NOISY_MODEL_PREFIXES = ("ir.", "base.", "bus.", "report.")
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def context() -> dict:
     """
     Call this first. Returns who the MCP server is authenticated as, the
@@ -46,7 +62,7 @@ def context() -> dict:
     return {"uid": uid, "user": user[0] if user else None, "odoo_version": version}
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_models(search: str = "", include_technical: bool = False) -> list[dict]:
     """
     List Odoo models the authenticated user can access. This is read live
@@ -76,7 +92,7 @@ def list_models(search: str = "", include_technical: bool = False) -> list[dict]
     return [{"model": m["model"], "label": m["name"]} for m in models]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def describe_model(model: str) -> dict:
     """
     Describe every field on an Odoo model: technical name, label, type,
@@ -108,7 +124,7 @@ def describe_model(model: str) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def search_read(
     model: str,
     domain: list | None = None,
@@ -141,7 +157,7 @@ def search_read(
     return client.execute_kw(model, "search_read", [domain or []], kwargs)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def read_records(model: str, ids: list[int], fields: list[str] | None = None) -> list[dict]:
     """
     Read specific records by ID. Use this when you already know the IDs
@@ -153,7 +169,7 @@ def read_records(model: str, ids: list[int], fields: list[str] | None = None) ->
     return client.execute_kw(model, "read", [ids], kwargs)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def aggregate(
     model: str,
     domain: list | None = None,
@@ -182,36 +198,65 @@ def aggregate(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_CREATE)
 def create_record(model: str, values: dict) -> dict:
     """
-    Create a new record. DISABLED unless MCP_ENABLE_WRITE=true is set on
-    the server's environment — this is a deliberate default, matching how
-    Odoo's own native MCP module ships read-only out of the box.
+    Create a new record. This is a WRITE tool — not read-only, not
+    destructive (nothing existing is overwritten). Gated server-side by
+    MCP_ENABLE_WRITE as a failsafe; the primary control is your MCP
+    client's per-tool permission setting for this tool.
     """
     if not WRITE_ENABLED:
         return {
-            "error": "Write access is disabled on this MCP server. "
-            "Set MCP_ENABLE_WRITE=true to enable create/update tools."
+            "error": "Write access is disabled on this MCP server's "
+            "infrastructure switch (MCP_ENABLE_WRITE=false). This is separate "
+            "from your client's own per-tool permission setting — both have "
+            "to allow it."
         }
     client = get_client()
     new_id = client.execute_kw(model, "create", [values])
     return {"id": new_id}
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_UPDATE)
 def update_record(model: str, ids: list[int], values: dict) -> dict:
     """
-    Update existing records. DISABLED unless MCP_ENABLE_WRITE=true is set
-    on the server's environment.
+    Update existing records. This is a WRITE tool, flagged destructive
+    since it overwrites existing field values in place. Gated server-side
+    by MCP_ENABLE_WRITE as a failsafe; the primary control is your MCP
+    client's per-tool permission setting for this tool.
     """
     if not WRITE_ENABLED:
         return {
-            "error": "Write access is disabled on this MCP server. "
-            "Set MCP_ENABLE_WRITE=true to enable create/update tools."
+            "error": "Write access is disabled on this MCP server's "
+            "infrastructure switch (MCP_ENABLE_WRITE=false). This is separate "
+            "from your client's own per-tool permission setting — both have "
+            "to allow it."
         }
     client = get_client()
     ok = client.execute_kw(model, "write", [ids, values])
+    return {"success": ok}
+
+
+@mcp.tool(annotations=DESTRUCTIVE_DELETE)
+def delete_record(model: str, ids: list[int]) -> dict:
+    """
+    Permanently delete one or more records. This is the DELETE tier — the
+    highest-risk tool this server exposes, and irreversible. Gated
+    server-side by MCP_ENABLE_DELETE independently of MCP_ENABLE_WRITE, so
+    an operator can allow create/update on this server while still
+    blocking deletion outright. The primary control is still your MCP
+    client's per-tool permission setting for this specific tool.
+    """
+    if not DELETE_ENABLED:
+        return {
+            "error": "Delete access is disabled on this MCP server's "
+            "infrastructure switch (MCP_ENABLE_DELETE=false). This is "
+            "separate from MCP_ENABLE_WRITE and from your client's own "
+            "per-tool permission setting — all relevant layers have to allow it."
+        }
+    client = get_client()
+    ok = client.execute_kw(model, "unlink", [ids])
     return {"success": ok}
 
 

@@ -6,18 +6,40 @@ introspection (`ir.model`, `fields_get`, `read_group`) rather than one
 hardcoded tool per module, so newly installed apps — including custom ones —
 show up automatically.
 
-## Tools
+## Tools and permission tiers
 
-| Tool | Purpose | Enabled by default |
-|---|---|---|
-| `context` | Who am I authenticated as, what Odoo version | yes |
-| `list_models` | List accessible models, live from `ir.model` | yes |
-| `describe_model` | Field-level schema for any model, live from `fields_get` | yes |
-| `search_read` | Filter + read records from any model | yes |
-| `read_records` | Read specific records by ID | yes |
-| `aggregate` | Grouped totals/counts/averages (`read_group`) | yes |
-| `create_record` | Create a record | **no** — needs `MCP_ENABLE_WRITE=true` |
-| `update_record` | Update a record | **no** — needs `MCP_ENABLE_WRITE=true` |
+Every tool carries standard MCP annotations (`readOnlyHint`, `destructiveHint`,
+`idempotentHint`) so an MCP client can offer real per-tool consent —
+"always allow", "ask every time", or "never" — rather than one blanket
+switch for the whole server. In Claude, this is what populates the
+per-tool permission controls in the connector's settings.
+
+| Tool | Tier | `readOnlyHint` | `destructiveHint` | Server-side failsafe |
+|---|---|---|---|---|
+| `context` | Read | true | false | always on |
+| `list_models` | Read | true | false | always on |
+| `describe_model` | Read | true | false | always on |
+| `search_read` | Read | true | false | always on |
+| `read_records` | Read | true | false | always on |
+| `aggregate` | Read | true | false | always on |
+| `create_record` | Write | false | false | `MCP_ENABLE_WRITE=true` |
+| `update_record` | Write | false | true | `MCP_ENABLE_WRITE=true` |
+| `delete_record` | Delete | false | true | `MCP_ENABLE_DELETE=true` |
+
+**Two layers of consent, both have to agree.** The server-side env vars
+(`MCP_ENABLE_WRITE`, `MCP_ENABLE_DELETE`) are an infrastructure failsafe —
+they exist so a leaked API key or a careless client can't silently mutate
+or delete data on a server nobody meant to expose that way. The *primary*
+permission surface is meant to be your MCP client's own per-tool controls,
+driven by the annotations above. Set the client side the way you actually
+want to work day to day (e.g. reads always allowed, writes ask every time,
+delete never) — the server flags are the backstop underneath that, not a
+replacement for it.
+
+`update_record` is flagged `destructiveHint: true` even though it's
+technically an update, not a delete — it overwrites existing field values
+in place with no undo, which is the same risk profile MCP's spec treats as
+destructive.
 
 ## Required environment variables
 
@@ -28,7 +50,8 @@ show up automatically.
 | `ODOO_USERNAME` | `admin` | The login, not the display name |
 | `ODOO_API_KEY` | (generated in Odoo) | Preferred over a raw password — see below |
 | `ODOO_PASSWORD` | — | Only used if `ODOO_API_KEY` isn't set |
-| `MCP_ENABLE_WRITE` | `false` | Set to `true` only for a least-privilege Odoo user |
+| `MCP_ENABLE_WRITE` | `false` | Gates `create_record`/`update_record`. Set to `true` only for a least-privilege Odoo user |
+| `MCP_ENABLE_DELETE` | `false` | Gates `delete_record` independently of `MCP_ENABLE_WRITE` — you can allow writes while still blocking deletion outright |
 | `PORT` | (set automatically by Railway) | Don't set manually on Railway |
 
 ### Generating an API key instead of using the admin password
