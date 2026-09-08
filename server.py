@@ -212,10 +212,19 @@ def _debug_env_names() -> dict:
     """
     TEMPORARY diagnostic — remove once the ODOO_API_KEY-not-visible issue
     is understood. Returns only the *names* of environment variables this
-    process can see (never values), so it's safe to leave enabled briefly
-    even in a shared context.
+    process can see (never values), plus, for the ones this bug is
+    actually about, whether each is present and its length — a length of
+    0 versus "key not found at all" are different bugs with different
+    fixes, and neither reveals the value.
     """
-    return {"env_var_names": sorted(os.environ.keys())}
+    watched = ["ODOO_API_KEY", "ODOO_PASSWORD", "ODOO_URL", "ODOO_DB", "ODOO_USERNAME"]
+    return {
+        "env_var_names": sorted(os.environ.keys()),
+        "watched": {
+            name: {"present": name in os.environ, "length": len(os.environ.get(name, ""))}
+            for name in watched
+        },
+    }
 
 
 @mcp.tool(annotations=READ_ONLY)
