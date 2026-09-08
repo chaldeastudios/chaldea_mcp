@@ -1,10 +1,33 @@
 # Odoo MCP server
 
-A Model Context Protocol server that talks to a self-hosted Odoo instance
-over its standard XML-RPC external API. Tools are built on live
+A Model Context Protocol server that talks to one or two Odoo instances
+over the standard XML-RPC external API. Tools are built on live
 introspection (`ir.model`, `fields_get`, `read_group`) rather than one
 hardcoded tool per module, so newly installed apps — including custom ones —
 show up automatically.
+
+## One or two instances
+
+The nine tools below (`context`, `list_models`, `describe_model`,
+`search_read`, `read_records`, `aggregate`, `create_record`,
+`update_record`, `delete_record`) always target the **initial** instance,
+configured by the unprefixed `ODOO_*` variables — unchanged from the single
+-instance version of this server, so an existing deployment needs no
+reconfiguration.
+
+A second, **transfer**, instance can be added by setting a second set of
+variables prefixed `ODOO_TRANSFER_*` (see below). Doing so registers a
+second copy of the same nine tools, each named `transfer_<name>` (e.g.
+`transfer_search_read`), pointed at that instance instead. If
+`ODOO_TRANSFER_URL` isn't set, none of the `transfer_*` tools are
+registered at all — the server behaves exactly as a single-instance one.
+
+Write and delete are gated **per instance, independently**:
+`MCP_ENABLE_WRITE` / `MCP_ENABLE_DELETE` govern the initial instance's
+tools; `MCP_ENABLE_TRANSFER_WRITE` / `MCP_ENABLE_TRANSFER_DELETE` govern
+the transfer instance's — enabling bulk write/delete against a transfer
+instance (e.g. to wipe and re-populate it) never touches, or implies
+anything about, the initial instance's own posture.
 
 ## Tools and permission tiers
 
@@ -43,6 +66,8 @@ destructive.
 
 ## Required environment variables
 
+### Initial instance (always required)
+
 | Variable | Example | Notes |
 |---|---|---|
 | `ODOO_URL` | `https://odoo-production-2cb7.up.railway.app` | No trailing slash needed |
@@ -52,7 +77,25 @@ destructive.
 | `ODOO_PASSWORD` | — | Only used if `ODOO_API_KEY` isn't set |
 | `MCP_ENABLE_WRITE` | `false` | Gates `create_record`/`update_record`. Set to `true` only for a least-privilege Odoo user |
 | `MCP_ENABLE_DELETE` | `false` | Gates `delete_record` independently of `MCP_ENABLE_WRITE` — you can allow writes while still blocking deletion outright |
-| `PORT` | (set automatically by Railway) | Don't set manually on Railway |
+
+### Transfer instance (optional — set all four `_URL`/`_DB`/`_USERNAME` and
+either `_API_KEY` or `_PASSWORD` together, or leave all unset)
+
+| Variable | Notes |
+|---|---|
+| `ODOO_TRANSFER_URL` | Setting this is what makes the `transfer_*` tools appear at all |
+| `ODOO_TRANSFER_DB` | |
+| `ODOO_TRANSFER_USERNAME` | |
+| `ODOO_TRANSFER_API_KEY` | Preferred over a raw password |
+| `ODOO_TRANSFER_PASSWORD` | Only used if `ODOO_TRANSFER_API_KEY` isn't set |
+| `MCP_ENABLE_TRANSFER_WRITE` | `false` | Gates `transfer_create_record`/`transfer_update_record`, independently of `MCP_ENABLE_WRITE` |
+| `MCP_ENABLE_TRANSFER_DELETE` | `false` | Gates `transfer_delete_record`, independently of `MCP_ENABLE_DELETE` |
+
+### Either instance
+
+| Variable | Notes |
+|---|---|
+| `PORT` | Set automatically by Railway — don't set manually there |
 
 ### Generating an API key instead of using the admin password
 

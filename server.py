@@ -11,6 +11,29 @@ Read tools are always on. Write tools are OFF by default (matching the
 posture of Odoo's own native Enterprise MCP module) and only activate when
 MCP_ENABLE_WRITE=true is set in the environment. Treat that flag like a
 loaded weapon — only point it at a least-privilege Odoo user.
+
+Two instances, two independent tool sets
+-----------------------------------------
+This server can talk to up to two separate Odoo databases: the original
+("initial") and a second one named "transfer" — e.g. a database being
+migrated to. The nine tools below are unprefixed and always target
+"initial", exactly as before this file grew a second instance: nothing
+about the original tool names, behaviour, or environment variables changed,
+so an existing deployment or client needs no reconfiguration to keep
+working.
+
+A second, transfer_-prefixed copy of the same nine tools targets the
+"transfer" instance, reading ODOO_TRANSFER_* environment variables instead
+of ODOO_*. Those tools only register at all if ODOO_TRANSFER_URL is set —
+so deploying this file with no transfer instance configured yet is a no-op
+for anyone already using the server today.
+
+Write and delete are gated per instance, independently:
+MCP_ENABLE_WRITE / MCP_ENABLE_DELETE for "initial",
+MCP_ENABLE_TRANSFER_WRITE / MCP_ENABLE_TRANSFER_DELETE for "transfer" — so
+enabling bulk write/delete against a transfer instance (e.g. to wipe and
+re-populate it) never has to touch, or even imply anything about, the
+write/delete posture of the original.
 """
 
 import asyncio
@@ -19,21 +42,23 @@ import os
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-from odoo_client import get_client
+from odoo_client import OdooClient, get_client, get_transfer_client, transfer_configured
 
 mcp = MCPServer("odoo-mcp")
 
-# Two independent infrastructure-level switches, one per risk tier. These
-# are a server-side failsafe, NOT the primary permission mechanism — the
-# primary mechanism is the read_only_hint / destructive_hint annotation on
-# each tool below, which lets an MCP client (Claude's connector settings,
-# for instance) offer per-tool "always allow / ask every time / never"
-# controls. A client that respects those hints will ask before ever
-# reaching a write or delete tool; these env vars exist so a compromised or
-# careless client still can't silently mutate data on a server that was
-# only ever meant to be read from.
+# Two independent infrastructure-level switches per instance, one per risk
+# tier. These are a server-side failsafe, NOT the primary permission
+# mechanism — the primary mechanism is the read_only_hint / destructive_hint
+# annotation on each tool below, which lets an MCP client (Claude's
+# connector settings, for instance) offer per-tool "always allow / ask every
+# time / never" controls. A client that respects those hints will ask
+# before ever reaching a write or delete tool; these env vars exist so a
+# compromised or careless client still can't silently mutate data on a
+# server that was only ever meant to be read from.
 WRITE_ENABLED = os.environ.get("MCP_ENABLE_WRITE", "false").lower() == "true"
 DELETE_ENABLED = os.environ.get("MCP_ENABLE_DELETE", "false").lower() == "true"
+TRANSFER_WRITE_ENABLED = os.environ.get("MCP_ENABLE_TRANSFER_WRITE", "false").lower() == "true"
+TRANSFER_DELETE_ENABLED = os.environ.get("MCP_ENABLE_TRANSFER_DELETE", "false").lower() == "true"
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True)
 WRITE_CREATE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)
@@ -46,14 +71,15 @@ DESTRUCTIVE_DELETE = ToolAnnotations(read_only_hint=False, destructive_hint=True
 _NOISY_MODEL_PREFIXES = ("ir.", "base.", "bus.", "report.")
 
 
-@mcp.tool(annotations=READ_ONLY)
-def context() -> dict:
-    """
-    Call this first. Returns who the MCP server is authenticated as, the
-    Odoo version it's talking to, and basic server info — establishes
-    context before any other tool call.
-    """
-    client = get_client()
+# --------------------------------------------------------------------------
+# Shared implementations. Each takes the already-resolved client, so the
+# two tools per name (unprefixed / transfer_-prefixed) are thin wrappers
+# that differ only in which client they pass and what MCP sees as the tool
+# name and docstring.
+# --------------------------------------------------------------------------
+
+
+def _context(client: OdooClient) -> dict:
     uid = client.authenticate()
     version = client.version()
     user = client.execute_kw(
@@ -62,21 +88,7 @@ def context() -> dict:
     return {"uid": uid, "user": user[0] if user else None, "odoo_version": version}
 
 
-@mcp.tool(annotations=READ_ONLY)
-def list_models(search: str = "", include_technical: bool = False) -> list[dict]:
-    """
-    List Odoo models the authenticated user can access. This is read live
-    from ir.model, so newly installed apps (or custom modules) show up
-    automatically without any change here.
-
-    Args:
-        search: optional case-insensitive substring to filter by model
-            name or technical name (e.g. "sale", "crm", "booking").
-        include_technical: if False (default), hides internal/technical
-            models (ir.*, base.*, bus.*, report.*) to keep the list focused
-            on business models.
-    """
-    client = get_client()
+def _list_models(client: OdooClient, search: str, include_technical: bool) -> list[dict]:
     domain = []
     if search:
         domain = ["|", ("name", "ilike", search), ("model", "ilike", search)]
@@ -92,20 +104,7 @@ def list_models(search: str = "", include_technical: bool = False) -> list[dict]
     return [{"model": m["model"], "label": m["name"]} for m in models]
 
 
-@mcp.tool(annotations=READ_ONLY)
-def describe_model(model: str) -> dict:
-    """
-    Describe every field on an Odoo model: technical name, label, type,
-    whether it's required, and — for relational fields — which model it
-    points to. This is fetched live via Odoo's own fields_get() call, the
-    same introspection mechanism Odoo's native MCP module uses, so it's
-    always accurate to whatever is actually installed.
-
-    Args:
-        model: technical model name, e.g. "res.partner", "sale.order",
-            "crm.lead". Use list_models() first if you don't know it.
-    """
-    client = get_client()
+def _describe_model(client: OdooClient, model: str) -> dict:
     fields = client.execute_kw(
         model,
         "fields_get",
@@ -124,6 +123,122 @@ def describe_model(model: str) -> dict:
     }
 
 
+def _search_read(
+    client: OdooClient,
+    model: str,
+    domain: list | None,
+    fields: list[str] | None,
+    limit: int,
+    offset: int,
+    order: str,
+) -> list[dict]:
+    kwargs: dict = {"limit": limit, "offset": offset}
+    if fields:
+        kwargs["fields"] = fields
+    if order:
+        kwargs["order"] = order
+    return client.execute_kw(model, "search_read", [domain or []], kwargs)
+
+
+def _read_records(client: OdooClient, model: str, ids: list[int], fields: list[str] | None) -> list[dict]:
+    kwargs = {"fields": fields} if fields else {}
+    return client.execute_kw(model, "read", [ids], kwargs)
+
+
+def _aggregate(
+    client: OdooClient,
+    model: str,
+    domain: list | None,
+    group_by: list[str] | None,
+    fields: list[str] | None,
+) -> list[dict]:
+    return client.execute_kw(model, "read_group", [domain or [], fields or [], group_by or []])
+
+
+def _create_record(client: OdooClient, model: str, values: dict, enabled: bool, flag_name: str) -> dict:
+    if not enabled:
+        return {
+            "error": f"Write access is disabled on this MCP server's infrastructure "
+            f"switch ({flag_name}=false). This is separate from your client's own "
+            f"per-tool permission setting — both have to allow it."
+        }
+    new_id = client.execute_kw(model, "create", [values])
+    return {"id": new_id}
+
+
+def _update_record(
+    client: OdooClient, model: str, ids: list[int], values: dict, enabled: bool, flag_name: str
+) -> dict:
+    if not enabled:
+        return {
+            "error": f"Write access is disabled on this MCP server's infrastructure "
+            f"switch ({flag_name}=false). This is separate from your client's own "
+            f"per-tool permission setting — both have to allow it."
+        }
+    ok = client.execute_kw(model, "write", [ids, values])
+    return {"success": ok}
+
+
+def _delete_record(client: OdooClient, model: str, ids: list[int], enabled: bool, flag_name: str) -> dict:
+    if not enabled:
+        return {
+            "error": f"Delete access is disabled on this MCP server's infrastructure "
+            f"switch ({flag_name}=false). This is separate from the write flag and "
+            f"from your client's own per-tool permission setting — all relevant "
+            f"layers have to allow it."
+        }
+    ok = client.execute_kw(model, "unlink", [ids])
+    return {"success": ok}
+
+
+# --------------------------------------------------------------------------
+# "initial" instance — unprefixed tool names, unchanged from before this
+# file supported a second instance.
+# --------------------------------------------------------------------------
+
+
+@mcp.tool(annotations=READ_ONLY)
+def context() -> dict:
+    """
+    Call this first. Returns who the MCP server is authenticated as, the
+    Odoo version it's talking to, and basic server info — establishes
+    context before any other tool call. Targets the "initial" instance.
+    """
+    return _context(get_client())
+
+
+@mcp.tool(annotations=READ_ONLY)
+def list_models(search: str = "", include_technical: bool = False) -> list[dict]:
+    """
+    List Odoo models the authenticated user can access, on the "initial"
+    instance. Read live from ir.model, so newly installed apps (or custom
+    modules) show up automatically without any change here.
+
+    Args:
+        search: optional case-insensitive substring to filter by model
+            name or technical name (e.g. "sale", "crm", "booking").
+        include_technical: if False (default), hides internal/technical
+            models (ir.*, base.*, bus.*, report.*) to keep the list focused
+            on business models.
+    """
+    return _list_models(get_client(), search, include_technical)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def describe_model(model: str) -> dict:
+    """
+    Describe every field on an Odoo model on the "initial" instance:
+    technical name, label, type, whether it's required, and — for
+    relational fields — which model it points to. Fetched live via Odoo's
+    own fields_get() call.
+
+    Args:
+        model: technical model name, e.g. "res.partner", "sale.order",
+            "crm.lead". Use list_models() first if you don't know it.
+    """
+    return _describe_model(get_client(), model)
+
+
 @mcp.tool(annotations=READ_ONLY)
 def search_read(
     model: str,
@@ -134,7 +249,8 @@ def search_read(
     order: str = "",
 ) -> list[dict]:
     """
-    Search and read records from any Odoo model in one call.
+    Search and read records from any Odoo model on the "initial" instance,
+    in one call.
 
     Args:
         model: technical model name, e.g. "sale.order", "product.product".
@@ -148,25 +264,17 @@ def search_read(
         offset: pagination offset.
         order: Odoo order string, e.g. "create_date desc".
     """
-    client = get_client()
-    kwargs: dict = {"limit": limit, "offset": offset}
-    if fields:
-        kwargs["fields"] = fields
-    if order:
-        kwargs["order"] = order
-    return client.execute_kw(model, "search_read", [domain or []], kwargs)
+    return _search_read(get_client(), model, domain, fields, limit, offset, order)
 
 
 @mcp.tool(annotations=READ_ONLY)
 def read_records(model: str, ids: list[int], fields: list[str] | None = None) -> list[dict]:
     """
-    Read specific records by ID. Use this when you already know the IDs
-    (e.g. from a previous search_read) and just need fresh or additional
-    field values.
+    Read specific records by ID on the "initial" instance. Use this when
+    you already know the IDs (e.g. from a previous search_read) and just
+    need fresh or additional field values.
     """
-    client = get_client()
-    kwargs = {"fields": fields} if fields else {}
-    return client.execute_kw(model, "read", [ids], kwargs)
+    return _read_records(get_client(), model, ids, fields)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -177,9 +285,10 @@ def aggregate(
     fields: list[str] | None = None,
 ) -> list[dict]:
     """
-    Grouped aggregation for simple analytics — totals, counts, and
-    averages broken down by one or more fields. This is Odoo's read_group
-    under the hood, the same mechanism its own reporting views use.
+    Grouped aggregation for simple analytics on the "initial" instance —
+    totals, counts, and averages broken down by one or more fields. This
+    is Odoo's read_group under the hood, the same mechanism its own
+    reporting views use.
 
     Args:
         model: technical model name, e.g. "sale.order.line".
@@ -190,74 +299,129 @@ def aggregate(
             "id:count"]. Odoo infers the aggregate function per field's
             type if you just pass the bare field name.
     """
-    client = get_client()
-    return client.execute_kw(
-        model,
-        "read_group",
-        [domain or [], fields or [], group_by or []],
-    )
+    return _aggregate(get_client(), model, domain, group_by, fields)
 
 
 @mcp.tool(annotations=WRITE_CREATE)
 def create_record(model: str, values: dict) -> dict:
     """
-    Create a new record. This is a WRITE tool — not read-only, not
-    destructive (nothing existing is overwritten). Gated server-side by
-    MCP_ENABLE_WRITE as a failsafe; the primary control is your MCP
-    client's per-tool permission setting for this tool.
+    Create a new record on the "initial" instance. This is a WRITE tool —
+    not read-only, not destructive (nothing existing is overwritten).
+    Gated server-side by MCP_ENABLE_WRITE as a failsafe; the primary
+    control is your MCP client's per-tool permission setting for this
+    tool.
     """
-    if not WRITE_ENABLED:
-        return {
-            "error": "Write access is disabled on this MCP server's "
-            "infrastructure switch (MCP_ENABLE_WRITE=false). This is separate "
-            "from your client's own per-tool permission setting — both have "
-            "to allow it."
-        }
-    client = get_client()
-    new_id = client.execute_kw(model, "create", [values])
-    return {"id": new_id}
+    return _create_record(get_client(), model, values, WRITE_ENABLED, "MCP_ENABLE_WRITE")
 
 
 @mcp.tool(annotations=WRITE_UPDATE)
 def update_record(model: str, ids: list[int], values: dict) -> dict:
     """
-    Update existing records. This is a WRITE tool, flagged destructive
-    since it overwrites existing field values in place. Gated server-side
-    by MCP_ENABLE_WRITE as a failsafe; the primary control is your MCP
-    client's per-tool permission setting for this tool.
+    Update existing records on the "initial" instance. This is a WRITE
+    tool, flagged destructive since it overwrites existing field values in
+    place. Gated server-side by MCP_ENABLE_WRITE as a failsafe; the
+    primary control is your MCP client's per-tool permission setting for
+    this tool.
     """
-    if not WRITE_ENABLED:
-        return {
-            "error": "Write access is disabled on this MCP server's "
-            "infrastructure switch (MCP_ENABLE_WRITE=false). This is separate "
-            "from your client's own per-tool permission setting — both have "
-            "to allow it."
-        }
-    client = get_client()
-    ok = client.execute_kw(model, "write", [ids, values])
-    return {"success": ok}
+    return _update_record(get_client(), model, ids, values, WRITE_ENABLED, "MCP_ENABLE_WRITE")
 
 
 @mcp.tool(annotations=DESTRUCTIVE_DELETE)
 def delete_record(model: str, ids: list[int]) -> dict:
     """
-    Permanently delete one or more records. This is the DELETE tier — the
-    highest-risk tool this server exposes, and irreversible. Gated
-    server-side by MCP_ENABLE_DELETE independently of MCP_ENABLE_WRITE, so
-    an operator can allow create/update on this server while still
-    blocking deletion outright. The primary control is still your MCP
-    client's per-tool permission setting for this specific tool.
+    Permanently delete one or more records on the "initial" instance. This
+    is the DELETE tier — the highest-risk tool this server exposes, and
+    irreversible. Gated server-side by MCP_ENABLE_DELETE independently of
+    MCP_ENABLE_WRITE. The primary control is still your MCP client's
+    per-tool permission setting for this specific tool.
     """
-    if not DELETE_ENABLED:
-        return {
-            "error": "Delete access is disabled on this MCP server's "
-            "infrastructure switch (MCP_ENABLE_DELETE=false). This is "
-            "separate from MCP_ENABLE_WRITE and from your client's own "
-            "per-tool permission setting — all relevant layers have to allow it."
-        }
-    client = get_client()
-    ok = client.execute_kw(model, "unlink", [ids])
-    return {"success": ok}
+    return _delete_record(get_client(), model, ids, DELETE_ENABLED, "MCP_ENABLE_DELETE")
+
+
+# --------------------------------------------------------------------------
+# "transfer" instance — same nine tools, transfer_-prefixed, only
+# registered at all if ODOO_TRANSFER_URL is set. A deployment with no
+# transfer instance configured yet simply doesn't offer these.
+# --------------------------------------------------------------------------
+
+if transfer_configured():
+
+    @mcp.tool(annotations=READ_ONLY)
+    def transfer_context() -> dict:
+        """Same as context(), against the "transfer" instance."""
+        return _context(get_transfer_client())
+
+    @mcp.tool(annotations=READ_ONLY)
+    def transfer_list_models(search: str = "", include_technical: bool = False) -> list[dict]:
+        """Same as list_models(), against the "transfer" instance."""
+        return _list_models(get_transfer_client(), search, include_technical)
+
+    @mcp.tool(annotations=READ_ONLY)
+    def transfer_describe_model(model: str) -> dict:
+        """Same as describe_model(), against the "transfer" instance."""
+        return _describe_model(get_transfer_client(), model)
+
+    @mcp.tool(annotations=READ_ONLY)
+    def transfer_search_read(
+        model: str,
+        domain: list | None = None,
+        fields: list[str] | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        order: str = "",
+    ) -> list[dict]:
+        """Same as search_read(), against the "transfer" instance."""
+        return _search_read(get_transfer_client(), model, domain, fields, limit, offset, order)
+
+    @mcp.tool(annotations=READ_ONLY)
+    def transfer_read_records(model: str, ids: list[int], fields: list[str] | None = None) -> list[dict]:
+        """Same as read_records(), against the "transfer" instance."""
+        return _read_records(get_transfer_client(), model, ids, fields)
+
+    @mcp.tool(annotations=READ_ONLY)
+    def transfer_aggregate(
+        model: str,
+        domain: list | None = None,
+        group_by: list[str] | None = None,
+        fields: list[str] | None = None,
+    ) -> list[dict]:
+        """Same as aggregate(), against the "transfer" instance."""
+        return _aggregate(get_transfer_client(), model, domain, group_by, fields)
+
+    @mcp.tool(annotations=WRITE_CREATE)
+    def transfer_create_record(model: str, values: dict) -> dict:
+        """
+        Same as create_record(), against the "transfer" instance. Gated by
+        MCP_ENABLE_TRANSFER_WRITE — independent of MCP_ENABLE_WRITE, which
+        only ever governs the "initial" instance.
+        """
+        return _create_record(
+            get_transfer_client(), model, values, TRANSFER_WRITE_ENABLED, "MCP_ENABLE_TRANSFER_WRITE"
+        )
+
+    @mcp.tool(annotations=WRITE_UPDATE)
+    def transfer_update_record(model: str, ids: list[int], values: dict) -> dict:
+        """
+        Same as update_record(), against the "transfer" instance. Gated by
+        MCP_ENABLE_TRANSFER_WRITE — independent of MCP_ENABLE_WRITE, which
+        only ever governs the "initial" instance.
+        """
+        return _update_record(
+            get_transfer_client(), model, ids, values, TRANSFER_WRITE_ENABLED, "MCP_ENABLE_TRANSFER_WRITE"
+        )
+
+    @mcp.tool(annotations=DESTRUCTIVE_DELETE)
+    def transfer_delete_record(model: str, ids: list[int]) -> dict:
+        """
+        Same as delete_record(), against the "transfer" instance. Gated by
+        MCP_ENABLE_TRANSFER_DELETE — independent of MCP_ENABLE_DELETE,
+        which only ever governs the "initial" instance. Enabling this can
+        never delete anything on the "initial" instance; there is no
+        shared switch between the two.
+        """
+        return _delete_record(
+            get_transfer_client(), model, ids, TRANSFER_DELETE_ENABLED, "MCP_ENABLE_TRANSFER_DELETE"
+        )
 
 
 if __name__ == "__main__":
