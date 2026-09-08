@@ -208,6 +208,17 @@ def context() -> dict:
 
 
 @mcp.tool(annotations=READ_ONLY)
+def _debug_env_names() -> dict:
+    """
+    TEMPORARY diagnostic — remove once the ODOO_API_KEY-not-visible issue
+    is understood. Returns only the *names* of environment variables this
+    process can see (never values), so it's safe to leave enabled briefly
+    even in a shared context.
+    """
+    return {"env_var_names": sorted(os.environ.keys())}
+
+
+@mcp.tool(annotations=READ_ONLY)
 def list_models(search: str = "", include_technical: bool = False) -> list[dict]:
     """
     List Odoo models the authenticated user can access, on the "initial"
