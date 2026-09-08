@@ -32,6 +32,19 @@ class OdooClient:
         ODOO_TRANSFER_URL/ODOO_TRANSFER_DB/... for a second instance.
         """
         self.env_prefix = env_prefix
+
+        # TEMPORARY diagnostic — logged to stdout (visible in `railway logs`
+        # / the Railway dashboard) on every OdooClient construction, names
+        # and lengths only, never values. Remove once the ODOO_API_KEY
+        # not-resolving-truthy issue is understood.
+        for suffix in ("_URL", "_DB", "_USERNAME", "_API_KEY", "_PASSWORD"):
+            name = f"{env_prefix}{suffix}"
+            val = os.environ.get(name)
+            print(
+                f"DIAG: {name} present={val is not None} length={len(val) if val is not None else 0}",
+                flush=True,
+            )
+
         self.url = os.environ[f"{env_prefix}_URL"].rstrip("/")
         self.db = os.environ[f"{env_prefix}_DB"]
         self.username = os.environ[f"{env_prefix}_USERNAME"]
